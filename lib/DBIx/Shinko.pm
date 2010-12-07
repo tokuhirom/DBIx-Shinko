@@ -156,10 +156,13 @@ sub get_dirty_columns {
 
 sub where_cond {
     my $self = shift;
-    my $inspector = DBIx::Inspector->new(dbh => $self->{__db}->dbh);
-    my ($table_info) = $inspector->tables($self->{__table}) or Carp::croak("cannot inspect database");
-    my @pk = map { $_->name } $table_info->primary_key();
-    Carp::croak "$self->{__table} does not have primary key" unless @pk;
+    my @pk = @{$self->{__db}->{pk_cache}->{$self->{__table}} ||= do {
+        my $inspector = DBIx::Inspector->new(dbh => $self->{__db}->dbh);
+        my ($table_info) = $inspector->tables($self->{__table}) or Carp::croak("cannot inspect database");
+        my @pk = map { $_->name } $table_info->primary_key();
+        Carp::croak "$self->{__table} does not have primary key" unless @pk;
+        \@pk
+    }};
 
     # validation
     my %pk = map { $_ => 1 } @pk;
