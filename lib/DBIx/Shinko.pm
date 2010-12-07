@@ -49,7 +49,7 @@ sub search {
     my ($sql, @bind) = $self->query_builder->select($table, $fields, $where, {limit => 1, %$opt});
     my $sth = $self->dbh->prepare($sql) or Carp::croak($self->dbh->errstr);
     $sth->execute(@bind) or Carp::croak($self->dbh->errstr);
-    my $iter = DBIx::Shinko::Iterator->new(sth => $sth, row_class => $self->row_class, dbh => $self->dbh);
+    my $iter = DBIx::Shinko::Iterator->new(sth => $sth, row_class => $self->row_class, db => $self, table => $table);
     return wantarray ? $iter->all : $iter;
 }
 
@@ -108,9 +108,15 @@ use Carp ();
 use DBIx::Inspector;
 
 sub new {
-    my ($class, $data, $dbh) = @_;
-    my $self = bless {%$data, __dbh__ => $dbh}, $class;
-    $self->mk_accessors(%$data);
+    my ($class, $data, $db, $table) = @_;
+    my $self = bless {
+        __is_dirty       => {},
+        __select_columns => [ keys %$data ],
+        __db             => $db,
+        __table          => $table,
+        %$data,
+    }, $class;
+    $self->mk_accessors(keys %$data);
     return $self;
 }
 
@@ -119,11 +125,13 @@ sub mk_accessors {
     $class = ref $class if ref $class;
     no strict 'refs';
     for my $name (@names) {
-        *{"$class\::$name"} = sub {
-            return $_[0]->get_column($name) if @_==1;
-            # return $_[0]->set_column($name => $_[1]) if @_==2;
-            Carp::croak("Too much parameters");
-        };
+        unless ($class->can($name)) {
+            *{"$class\::$name"} = sub {
+                return $_[0]->get_column($name) if @_==1;
+                return $_[0]->set_column($name => $_[1]) if @_==2;
+                Carp::croak("Too much parameters");
+            };
+        }
     }
 }
 
@@ -133,17 +141,61 @@ sub get_column {
     $self->{$name};
 }
 
+sub set_column {
+    my ($self, $name, $val) = @_;
+    $self->{$name} = $val;
+    $self->{__is_dirty}->{$name}++;
+}
+
+sub get_dirty_columns {
+    my $self = shift;
+    my %rows = map { $_ => $self->get_column($_) }
+      keys %{ $self->{__is_dirty} };
+    return \%rows;
+}
+
+sub where_cond {
+    my $self = shift;
+    my $inspector = DBIx::Inspector->new(dbh => $self->{__db}->dbh);
+    my ($table_info) = $inspector->tables($self->{__table}) or Carp::croak("cannot inspect database");
+    my @pk = map { $_->name } $table_info->primary_key();
+    Carp::croak "$self->{__table} does not have primary key" unless @pk;
+
+    # validation
+    my %pk = map { $_ => 1 } @pk;
+    for my $col (@{$self->{__select_columns}}) {
+        delete $pk{$col};
+    }
+    Carp::croak "select clause does not contains pk columns" if %pk;
+
+    return +{
+        map { $_ => $self->get_column($_) } @pk
+    };
+}
+
+sub delete {
+    my $self = shift;
+    my $where = $self->where_cond();
+    $self->{__db}->delete($self->{__table}, $where);
+}
+
+sub update {
+    my $self = shift;
+    my $where = $self->where_cond();
+    $self->{__db}->update($self->{__table}, $self->get_dirty_columns(), $where);
+}
+
 package DBIx::Shinko::Iterator;
 use Class::Accessor::Lite (
     new => 1,
-    ro => [qw/sth row_class dbh/],
+    ro => [qw/sth row_class db table/],
 );
 
 sub next {
     my $self = shift;
     my $data = $self->sth->fetchrow_hashref();
     if ($data) {
-        return $self->row_class->new($data, $self->dbh);
+        return $self->row_class->new($data, $self->db, $self->table);
     } else {
         return;
     }
